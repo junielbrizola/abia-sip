@@ -19,20 +19,23 @@ FROM golang:$GOVERSION AS builder
 ARG TARGETPLATFORM
 ARG VERSION=0.0.0-dev
 
-WORKDIR /workspace
+WORKDIR /workspace/apps/realtime/sip
 
 # install libopus
 RUN apt-get update && apt-get install -y pkg-config libopus-dev libopusfile-dev libsoxr-dev
 
 # download go modules
-COPY go.mod .
-COPY go.sum .
+COPY sip/go.mod ./go.mod
+COPY sip/go.sum ./go.sum
+# The local replacement in go.mod must resolve to the same ABIA protocol source
+# in container builds as it does in the repository checkout.
+COPY protocol/ /workspace/apps/realtime/protocol/
 RUN go mod download
 
 # copy source
-COPY cmd/ cmd/
-COPY pkg/ pkg/
-COPY version/ version/
+COPY sip/cmd/ cmd/
+COPY sip/pkg/ pkg/
+COPY sip/version/ version/
 
 # build
 RUN if [ "$TARGETPLATFORM" = "linux/arm64" ]; then GOARCH=arm64; else GOARCH=amd64; fi && \
@@ -49,7 +52,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # copy binary
-COPY --from=builder /workspace/livekit-sip /bin/
+COPY --from=builder /workspace/apps/realtime/sip/livekit-sip /bin/
 
 WORKDIR /sip
 

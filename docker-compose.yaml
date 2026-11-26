@@ -8,15 +8,21 @@ services:
     # The following line might be uncommented to run on MacOS
     # for testing and development purposes only.
     # network_mode: host
-  livekit:
-    image: livekit/livekit-server
+  abia-realtime:
+    image: abia-realtime-server:local
+    build:
+      context: ..
+      dockerfile: server/Dockerfile
     command: --dev --redis-host localhost:6379
     network_mode: host
     depends_on:
         redis:
             condition: service_started
-  sip:
-    image: livekit/sip
+  abia-realtime-sip:
+    image: abia-realtime-sip:local
+    build:
+      context: ..
+      dockerfile: sip/build/sip/Dockerfile
     network_mode: host
     environment:
       SIP_CONFIG_BODY: |

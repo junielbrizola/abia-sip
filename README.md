@@ -99,13 +99,19 @@ sip_registrations:
     password: secret
     # auth_username: 1000                    # digest username, if issued separately
     # domain: provider.example               # AOR host, defaults to the registrar host
+    # contact_host: sip.abia.example          # stable externally reachable host shared by replicas
     # expiry: 10m                            # requested lifetime; the registrar may grant less
     # keepalive: 25s                         # OPTIONS interval to hold the NAT binding open
 ```
 
-Each node registers its own Contact, so point one node at a given account. Registration only
-tells the provider where to send calls: inbound INVITEs still arrive on the normal inbound path
-and are authenticated and dispatched by trunk as usual.
+All SIP nodes coordinate ownership for each AOR through the shared Redis service. Exactly one
+node sends REGISTER refreshes at a time; a graceful drain withdraws the binding before releasing
+the lease, and a lost lease stops refreshes without deleting a binding that may belong to the new
+owner. If replicas can take ownership of one account, set the same stable `contact_host` on every
+node and route that host to the SIP fleet. Registration only tells the provider where to send
+calls: inbound INVITEs still arrive on the normal inbound path and are authenticated and
+dispatched by trunk as usual. Without `contact_host`, the SIP node address is used and the
+configuration is suitable only for a single-node registration.
 
 The Contact is this node's signaling address, which behind NAT is a private one. That works
 with providers that route to the source address they observe, which is what the REGISTER asks
@@ -116,8 +122,9 @@ should use.
 refresh a NAT mapping on its own, and a mapping that expires stops inbound calls while the
 registration still looks healthy. Set it to a negative value to disable.
 
-Because losing a registration silently stops inbound calls, each one is also exported as
-`livekit_sip_registrations_active`, labeled by registrar and address-of-record.
+Because losing a registration silently stops inbound calls, the service exports the
+aggregate `livekit_sip_registrations_active_total` gauge. Registrar URIs and addresses-of-record
+are not exposed as metric labels.
 
 ### Using the SIP service
 
@@ -217,7 +224,7 @@ mage build
 
 ##### Running the service
 
-To run against a local LiveKit server, a redis server must be running locally. All servers must be configured to communicate over localhost. Create a file named `config.yaml` with the following content:
+To run against the local ABIA Realtime server, a Redis server must be running locally. All services must be configured to communicate over localhost. Create a file named `config.yaml` with the following content:
 
 ```yaml
 log_level: debug
@@ -234,9 +241,7 @@ sip --config=config.yaml
 
 #### Running with Docker
 
-To run against a local LiveKit server, a Redis server must be running locally. The SIP service must be instructed to connect to LiveKit server and Redis on the host. The host network is accessible from within the container on IP:
-- host.docker.internal on MacOS and Windows
-- 172.17.0.1 on linux
+To run against the local ABIA Realtime server and Redis, the SIP container uses host networking. Configure both services at `localhost` from the SIP container.
 
 Create a file named `config.yaml` with the following content:
 
@@ -244,20 +249,22 @@ Create a file named `config.yaml` with the following content:
 log_level: debug
 api_key: <your-api-key>
 api_secret: <your-api-secret>
-ws_url: ws://host.docker.internal:7880 (or ws://172.17.0.1:7880 on linux)
+ws_url: ws://localhost:7880
 redis:
-  address: host.docker.internal:6379 (or 172.17.0.1:6379 on linux)
+  address: localhost:6379
 ```
 
 The container must be run with host networking enabled. SIP by default uses UDP port 10000 -> 20000 and 5060, this large range of ports is hard for docker to handle at this time.
 
-Then to run the service:
+From the ABIA repository root, build and run this SIP fork:
 
 ```shell
+cd apps/realtime
+docker build -f sip/build/sip/Dockerfile -t abia-realtime-sip:local .
 docker run --rm \
-    -e SIP_CONFIG_BODY="`cat config.yaml`" \
+    -e SIP_CONFIG_BODY="$(cat sip/config.yaml)" \
     --network host \
-    livekit/sip
+    abia-realtime-sip:local
 ```
 
 
