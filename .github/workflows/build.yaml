@@ -20,13 +20,25 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   integration:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          lfs: true
+          path: apps/realtime/sip
+
+      # The SIP module replaces protocol with the ABIA fork. Keep this pin in
+      # sync with the protocol gitlink in the ABIA root repository.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: junielbrizola/abia-protocol
+          ref: 36e1b27375d9f560868642642bdd0f669a610756
+          token: ${{ secrets.ABIA_SUBMODULES_READ_TOKEN || github.token }}
+          path: apps/realtime/protocol
 
       - name: Build docker image
-        run: docker build -t sip -f ./build/sip/Dockerfile .
+        run: docker build -t sip -f ./apps/realtime/sip/build/sip/Dockerfile ./apps/realtime
