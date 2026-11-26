@@ -116,6 +116,7 @@ func runService(ctx context.Context, c *cli.Command) error {
 	if err != nil {
 		return err
 	}
+	sipsrv.SetRegistrationLeaseStore(sip.NewRedisRegistrationLeaseStore(rc))
 	svc := service.NewService(conf, log, sipsrv, sipsrv.Stop, sipsrv.ActiveCalls, psrpcClient, bus, mon)
 	svc.SetSIPServiceDrain(sipsrv.StopRegistrations)
 	sipsrv.SetHandler(svc)
