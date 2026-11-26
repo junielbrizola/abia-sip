@@ -18,6 +18,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,8 +45,9 @@ const (
 	// needs one request, plus one retry per challenge and one per expiry renegotiation.
 	registerMaxAttempts = 5
 
-	registerMinBackoff = 2 * time.Second
-	registerMaxBackoff = 2 * time.Minute
+	registerMinBackoff    = 2 * time.Second
+	registerMaxBackoff    = 2 * time.Minute
+	registerStartupJitter = 5 * time.Second
 
 	// registerTimeout bounds one REGISTER exchange, including its authentication retry. A
 	// non-INVITE client transaction dies at timer B after 32s anyway, and a registrar that
@@ -152,6 +155,9 @@ type registrant struct {
 
 	stop     core.Fuse
 	stopOnce sync.Once
+	// keepBindingOnStop is set only when cluster ownership is lost. In that case
+	// unregistering could remove a replacement binding written by the new owner.
+	keepBindingOnStop atomic.Bool
 	// Published before stop breaks; read only after observing stop.
 	stopDeadline time.Time
 	done         chan struct{}
@@ -171,6 +177,11 @@ func newRegistrant(log logger.Logger, cli SIPClient, mon *stats.Monitor, conf *c
 	aor := sip.Uri{Scheme: registrar.Scheme, User: rc.Username, Host: domain}
 
 	contact := getContactURI(conf, sconf.SignalingIP, tr)
+	if rc.ContactHost != "" {
+		port := contact.Addr.Port()
+		contact.Host = rc.ContactHost
+		contact.Addr = netip.AddrPortFrom(netip.Addr{}, port)
+	}
 	contact.User = rc.Username
 
 	authUser := rc.AuthUsername
@@ -208,6 +219,29 @@ func newRegistrant(log logger.Logger, cli SIPClient, mon *stats.Monitor, conf *c
 	)
 	r.setState(RegistrationState{})
 	return r, nil
+}
+
+func validSIPContactHost(host string) bool {
+	if host == "" || strings.TrimSpace(host) != host {
+		return false
+	}
+	if address, err := netip.ParseAddr(host); err == nil {
+		return address.Zone() == ""
+	}
+	if len(host) > 253 || strings.ContainsAny(host, ":/@[]%\\ \t\r\n") {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, r := range label {
+			if !(r >= 'a' && r <= 'z') && !(r >= 'A' && r <= 'Z') && !(r >= '0' && r <= '9') && r != '-' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // parseRegistrarURI accepts a SIP URI or a bare "host[:port]" address.
@@ -260,6 +294,15 @@ func (r *registrant) Stop() {
 	r.waitStopped()
 }
 
+// StopWithoutUnregister stops this worker after its shared lease is lost. The
+// lease may already belong to another node, so withdrawing the shared AOR here
+// could remove the new owner's binding.
+func (r *registrant) StopWithoutUnregister() {
+	r.keepBindingOnStop.Store(true)
+	r.stopBefore(time.Now().Add(unregisterTimeout))
+	r.waitStopped()
+}
+
 // stopBefore signals without waiting, so a service can stop all accounts promptly
 // and give every withdrawal the same global deadline instead of N independent budgets.
 func (r *registrant) stopBefore(deadline time.Time) {
@@ -280,9 +323,10 @@ func (r *registrant) State() RegistrationState {
 }
 
 func (r *registrant) setState(st RegistrationState) {
-	r.state.Store(&st)
+	previous := r.state.Swap(&st)
 	if r.mon != nil {
-		r.mon.RegistrationActive(r.registrar.String(), r.aor.String(), st.Registered)
+		wasActive := previous != nil && previous.Registered
+		r.mon.RegistrationActive(wasActive, st.Registered)
 	}
 }
 
@@ -295,7 +339,7 @@ type registrationResult struct {
 
 func (r *registrant) run() {
 	defer close(r.done)
-	refresh := time.NewTimer(0)
+	refresh := time.NewTimer(randomRegistrationDelay(registerStartupJitter))
 	defer refresh.Stop()
 	lapse := time.NewTimer(time.Hour)
 	lapse.Stop()
@@ -331,7 +375,13 @@ func (r *registrant) run() {
 			if pinging != nil {
 				<-pinging
 			}
-			r.unregister()
+			if r.keepBindingOnStop.Load() {
+				// The upstream binding may remain until its negotiated expiry, but
+				// this node can no longer confirm or refresh it after lease loss.
+				r.setState(RegistrationState{Error: errRegistrationLeaseLost})
+			} else {
+				r.unregister()
+			}
 			return
 		case <-refresh.C:
 			if r.stop.IsBroken() {
@@ -354,11 +404,14 @@ func (r *registrant) run() {
 				r.setState(RegistrationState{Registered: r.stillBound(), Expiry: r.granted, Error: result.err})
 				if errors.Is(result.err, errAuthFailed) {
 					backoff = registerMaxBackoff
-					r.log.Errorw("SIP registration was rejected", result.err, "retryIn", backoff)
-				} else {
-					r.log.Warnw("SIP registration failed, retrying", result.err, "retryIn", backoff)
 				}
-				refresh.Reset(backoff)
+				retryIn := jitteredRegistrationBackoff(backoff)
+				if errors.Is(result.err, errAuthFailed) {
+					r.log.Errorw("SIP registration was rejected", result.err, "retryIn", retryIn)
+				} else {
+					r.log.Warnw("SIP registration failed, retrying", result.err, "retryIn", retryIn)
+				}
+				refresh.Reset(retryIn)
 				if backoff *= 2; backoff > registerMaxBackoff {
 					backoff = registerMaxBackoff
 				}
@@ -397,6 +450,23 @@ func (r *registrant) run() {
 			pinging = nil
 		}
 	}
+}
+
+func randomRegistrationDelay(max time.Duration) time.Duration {
+	if max <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int63n(int64(max) + 1))
+}
+
+// jitteredRegistrationBackoff spreads retries across a bounded interval so a fleet
+// recovering from one registrar outage does not reconnect in lockstep.
+func jitteredRegistrationBackoff(backoff time.Duration) time.Duration {
+	if backoff <= 0 {
+		return 0
+	}
+	minimum := backoff / 2
+	return minimum + randomRegistrationDelay(backoff-minimum)
 }
 
 // stillBound reports whether the registrar should still have a binding for us.

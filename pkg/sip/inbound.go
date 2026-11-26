@@ -16,8 +16,7 @@ package sip
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -47,6 +46,7 @@ import (
 	"github.com/livekit/protocol/utils/traceid"
 	"github.com/livekit/psrpc"
 	"github.com/livekit/sipgo/sip"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/livekit/sip/pkg/config"
 	"github.com/livekit/sip/pkg/stats"
@@ -77,15 +77,6 @@ var errNoACK = errors.New("no ACK received for 200 OK")
 const statusRequestPending sip.StatusCode = 491
 
 const contentTypeSDP string = "application/sdp"
-
-// hashPassword creates a SHA256 hash of the password for logging purposes
-func hashPassword(password string) string {
-	if password == "" {
-		return "<empty>"
-	}
-	hash := sha256.Sum256([]byte(password))
-	return hex.EncodeToString(hash[:8]) // Use first 8 bytes for shorter hash
-}
 
 type inboundCallInfo struct {
 	sync.Mutex
@@ -191,12 +182,7 @@ func (cm *callManager) handleInviteAuth(log logger.Logger, req *sip.Request, aut
 	if auth.Realm == "" {
 		auth.Realm = UserAgent
 	}
-	log = log.WithValues(
-		"username", auth.Username,
-		"passwordHash", hashPassword(auth.Password),
-		"method", req.Method.String(),
-		"uri", req.Recipient.String(),
-	)
+	log = log.WithValues("method", req.Method.String())
 
 	log.Infow("Starting SIP invite authentication")
 
@@ -228,11 +214,7 @@ func (cm *callManager) handleInviteAuth(log logger.Logger, req *sip.Request, aut
 		Algorithm: "MD5",
 		Stale:     stale,
 	}
-	log.Debugw("Created digest challenge",
-		"realm", chal.Realm,
-		"nonce", chal.Nonce,
-		"algorithm", chal.Algorithm,
-	)
+	log.Debugw("Created SIP digest challenge", "algorithm", chal.Algorithm)
 	return Result{Code: sip.StatusProxyAuthRequired, Status: "Unauthorized"}, sip.NewHeader("Proxy-Authenticate", chal.String())
 }
 
@@ -247,33 +229,23 @@ func (cm *callManager) validateAuthorization(log logger.Logger, req *sip.Request
 		sipCallID = h.Value()
 	}
 
-	log.Debugw("Found Proxy-Authorization header, parsing credentials")
+	log.Debugw("Found Proxy-Authorization header")
 	cred, err := digest.ParseCredentials(credentials)
 	if err != nil {
-		log.Warnw("Failed to parse Proxy-Authorization credentials", err,
-			"headerValue", credentials,
-		)
+		log.Warnw("Failed to parse Proxy-Authorization credentials", errors.New("invalid digest authorization"))
 		return Result{Code: sip.StatusUnauthorized, Status: "Bad credentials"}, false
 	}
 
-	// Set credURI and credUsername in logger early to avoid repetitive logging
-	log = log.WithValues("credURI", cred.URI, "credUsername", cred.Username)
-
-	log.Debugw("Parsed credentials successfully", "cred", cred)
-
 	// Validate that the username in the request matches the expected username
 	if cred.Username != auth.Username {
-		log.Warnw("Authentication failed - username mismatch", errors.New("username mismatch"),
-			"expectedUsername", auth.Username,
-			"receivedUsername", cred.Username,
-		)
+		log.Warnw("SIP digest authentication failed", errors.New("digest username mismatch"))
 		return Result{Code: sip.StatusUnauthorized, Status: "Unauthorized"}, false
 	}
 
 	// The nonce proves its own origin, so the challenge may have been sent by another server.
 	if err := checkDigestNonce(cm.sealer, cred.Nonce, sipCallID, time.Now()); err != nil {
 		if !errors.Is(err, errDigestNonceExpired) {
-			log.Warnw("Authentication failed - invalid nonce", err, "nonce", cred.Nonce)
+			log.Warnw("Authentication failed - invalid nonce", errors.New("invalid SIP digest nonce"))
 			return Result{Code: sip.StatusUnauthorized, Status: "Bad credentials"}, false
 		}
 		stale = true
@@ -284,12 +256,6 @@ func (cm *callManager) validateAuthorization(log logger.Logger, req *sip.Request
 		Nonce:     cred.Nonce,
 		Algorithm: "MD5",
 	}
-	log.Debugw("Computing digest response",
-		"challengeRealm", chal.Realm,
-		"challengeNonce", chal.Nonce,
-		"challengeAlgorithm", chal.Algorithm,
-	)
-
 	digCred, err := digest.Digest(&chal, digest.Options{
 		Method:   "INVITE",
 		URI:      cred.URI,
@@ -302,22 +268,14 @@ func (cm *callManager) validateAuthorization(log logger.Logger, req *sip.Request
 		return Result{Code: sip.StatusUnauthorized, Status: "Bad credentials"}, false
 	}
 
-	log.Debugw("Digest computation completed",
-		"expectedResponse", digCred.Response,
-		"receivedResponse", cred.Response,
-		"responsesMatch", cred.Response == digCred.Response,
-	)
-
-	if cred.Response != digCred.Response {
-		log.Warnw("Authentication failed - response mismatch", errors.New("response mismatch"),
-			"expectedResponse", digCred.Response,
-			"receivedResponse", cred.Response,
-		)
+	providedResponse := strings.ToLower(cred.Response)
+	if subtle.ConstantTimeCompare([]byte(providedResponse), []byte(digCred.Response)) != 1 {
+		log.Warnw("SIP digest authentication failed", errors.New("digest response mismatch"))
 		return Result{Code: sip.StatusUnauthorized, Status: "Unauthorized"}, false
 	}
 
 	if stale {
-		log.Infow("Authentication failed - stale nonce", "nonce", cred.Nonce)
+		log.Infow("SIP digest authentication rejected due to stale nonce")
 		return Result{Code: sip.StatusProxyAuthRequired, Status: "Expired nonce"}, true
 	}
 
@@ -391,9 +349,7 @@ func (cm *callManager) newState(r AuthInfo, cc *sipInbound) *CallState {
 // TODO(alexfish): Move this into manager.go
 func (cm *callManager) processInvite(req *sip.Request, tx sip.ServerTransaction) (retErr error) {
 	start := time.Now()
-	ctx := context.Background()
-	ctx, span := Tracer.Start(ctx, "sip.callManager.processInvite")
-	defer span.End()
+	var ctx context.Context
 
 	var state *CallState
 	var cc *sipInbound
@@ -447,8 +403,23 @@ func (cm *callManager) processInvite(req *sip.Request, tx sip.ServerTransaction)
 		tx.Terminate()
 		return psrpc.NewError(psrpc.InvalidArgument, fmt.Errorf("invite validation failed: %w", err))
 	}
+	callTraceID, parentSpan, err := newABIATraceContext(cc)
+	if err != nil {
+		// Trace correlation is diagnostic metadata. A local entropy or ID
+		// generation failure must not reject an otherwise valid inbound call.
+		cc.log.Warnw("could not create SIP trace context; continuing without trace correlation", err)
+		callTraceID = ""
+		parentSpan = trace.SpanContext{}
+	}
+	cc.abiaTraceID = callTraceID
+	ctx = trace.ContextWithSpanContext(context.Background(), parentSpan)
+	ctx, span := Tracer.Start(ctx, "sip.callManager.processInvite")
+	defer span.End()
 	tid := traceid.FromGUID(string(cc.ID()))
 	log := cc.log.WithValues("traceID", tid.String())
+	if callTraceID != "" {
+		log = log.WithValues("trace_id", callTraceID)
+	}
 	cc.log = log
 
 	// Replay cached final rejection for retries reusing the same Call-ID +
@@ -1941,6 +1912,11 @@ func (c *inboundCall) createLiveKitParticipant(ctx context.Context, rconf RoomCo
 	for k, v := range c.extraAttrs {
 		partConf.Attributes[k] = v
 	}
+	// Write the reserved value after caller-controlled SIP header mappings so
+	// remote headers cannot spoof the call's correlation context.
+	if c.cc.abiaTraceID != "" {
+		partConf.Attributes[AttrABIASIPTraceID] = c.cc.abiaTraceID
+	}
 	partConf.Attributes[livekit.AttrSIPCallStatus] = status.Attribute()
 	select {
 	case <-ctx.Done():
@@ -2195,6 +2171,7 @@ type sipInbound struct {
 	id          LocalTag // SCL
 	tag         RemoteTag
 	sipCallID   string
+	abiaTraceID string
 	invite      *sip.Request
 	inviteCSeq  uint32
 	inviteTx    sip.ServerTransaction

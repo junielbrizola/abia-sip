@@ -52,6 +52,15 @@ func audioCodecByName(t testing.TB, name string) msdk.CodecType {
 	return nil
 }
 
+type discardPCMWriter struct {
+	sampleRate int
+}
+
+func (w *discardPCMWriter) String() string                     { return "discardPCMWriter" }
+func (w *discardPCMWriter) SampleRate() int                    { return w.sampleRate }
+func (w *discardPCMWriter) Close() error                       { return nil }
+func (w *discardPCMWriter) WriteSample(msdk.PCM16Sample) error { return nil }
+
 func testAudioPT(c msdk.CodecType) byte {
 	info := c.Info()
 	if info.RTPIsStatic {
@@ -142,7 +151,7 @@ func (c *pcmCollector) since(n int) msdk.PCM16Sample {
 // buffer anchors, and a synthesized MediaConfig. The pipeline itself is swapped
 // on configure / reconfigure.
 type pipelineHarness struct {
-	t           *testing.T
+	t           testing.TB
 	local       *testUDPConn
 	remote      *testUDPConn
 	port        *udpConn
@@ -161,7 +170,7 @@ type pipelineHarness struct {
 	codec       msdk.AudioCodec
 }
 
-func newPipelineHarness(t *testing.T, sampleRate int) *pipelineHarness {
+func newPipelineHarness(t testing.TB, sampleRate int) *pipelineHarness {
 	t.Helper()
 	local, remote := newUDPPipe()
 	log := logger.NewTestLogger(t)
@@ -199,6 +208,54 @@ func newPipelineHarness(t *testing.T, sampleRate int) *pipelineHarness {
 		_ = remote.Close()
 	})
 	return h
+}
+
+func BenchmarkSIPMediaPipelineInboundDecode(b *testing.B) {
+	for _, codecName := range []string{"PCMU", "PCMA", "G722"} {
+		b.Run(codecName, func(b *testing.B) {
+			const roomSampleRate = 48000
+			h := newPipelineHarness(b, roomSampleRate)
+			codec := audioCodecByName(b, codecName)
+			h.audioIn.Swap(&discardPCMWriter{sampleRate: roomSampleRate})
+			h.configureType(codec, 0, testAudioPT(codec), testDTMFPT, false)
+
+			clockRate := h.codec.Info().RTPClockRate
+			if clockRate == 0 {
+				clockRate = h.codec.Info().SampleRate
+			}
+			var packets msrtp.Buffer
+			stream := msrtp.NewSeqWriter(&packets, clockRate).NewStream(h.audio.Type, clockRate)
+			encoder := msrtp.EncodePCM(stream, h.codec)
+			if err := encoder.WriteSample(h.codecFrame()); err != nil {
+				b.Fatal(err)
+			}
+			if err := encoder.Close(); err != nil {
+				b.Fatal(err)
+			}
+			if len(packets) == 0 {
+				b.Fatal("codec produced no RTP packets")
+			}
+
+			handler := h.pipeline.muxToRoom.Load()
+			if handler == nil || *handler == nil {
+				b.Fatal("media pipeline has no inbound RTP handler")
+			}
+			packet := packets[0]
+			header := packet.Header
+			header.SSRC = 0xAB1A
+			frameSamples := uint32(clockRate / msrtp.DefFramesPerSec)
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				header.SequenceNumber++
+				header.Timestamp += frameSamples
+				if err := (*handler).HandleRTP(&header, packet.Payload); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
 }
 
 func dtmfCodec(s *msdk.CodecSet, typ byte, rate, ch int) *sdp.CodecInfo {

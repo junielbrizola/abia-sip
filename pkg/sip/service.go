@@ -81,9 +81,16 @@ type Service struct {
 	srv     *Server
 	closers []io.Closer
 
-	registrationsMu      sync.Mutex
-	registrationsStopped bool
-	registrants          []*registrant
+	keyLogSyncMu      sync.Mutex
+	keyLogSyncStop    chan struct{}
+	keyLogSyncDone    chan struct{}
+	keyLogSyncStopped bool
+	stopOnce          sync.Once
+
+	registrationsMu        sync.Mutex
+	registrationsStopped   bool
+	registrationOwners     []*registrationOwner
+	registrationLeaseStore RegistrationLeaseStore
 
 	manager CallManager
 }
@@ -191,31 +198,88 @@ func (s *Service) ActiveCalls() ActiveCalls {
 func (s *Service) StopRegistrations() {
 	s.registrationsMu.Lock()
 	s.registrationsStopped = true
-	registrants := s.registrants
+	owners := s.registrationOwners
 	deadline := time.Now().Add(unregisterTimeout)
 	// Every owner receives stop before any wait; withdrawals share this deadline
 	// and run concurrently in their existing owners, without N serial timeouts.
-	for _, r := range registrants {
-		r.stopBefore(deadline)
+	for _, owner := range owners {
+		owner.StopBefore(deadline)
 	}
 	s.registrationsMu.Unlock()
-	for _, r := range registrants {
-		r.waitStopped()
+	for _, owner := range owners {
+		owner.WaitStopped()
 	}
 	s.registrationsMu.Lock()
-	s.registrants = nil
+	s.registrationOwners = nil
 	s.registrationsMu.Unlock()
 }
 
 func (s *Service) Stop() {
-	// Unregister while the SIP client is still usable.
-	s.StopRegistrations()
-	s.manager.Stop()
-	s.cli.Stop()
-	s.srv.Stop()
-	s.mon.Stop()
-	for _, c := range s.closers {
-		_ = c.Close()
+	s.stopOnce.Do(func() {
+		// Unregister while the SIP client is still usable.
+		s.StopRegistrations()
+		s.stopKeyLogSync()
+		s.manager.Stop()
+		s.cli.Stop()
+		s.srv.Stop()
+		s.mon.Stop()
+		for _, c := range s.closers {
+			_ = c.Close()
+		}
+		s.closers = nil
+	})
+}
+
+func (s *Service) startKeyLogSync(f *os.File) error {
+	s.keyLogSyncMu.Lock()
+	defer s.keyLogSyncMu.Unlock()
+	if s.keyLogSyncStopped {
+		return errors.New("cannot start SIP TLS key-log sync after service stop")
+	}
+	if s.keyLogSyncDone != nil {
+		return errors.New("SIP TLS key-log sync already started")
+	}
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	s.keyLogSyncStop = stop
+	s.keyLogSyncDone = done
+	s.closers = append(s.closers, f)
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				_ = f.Sync()
+			}
+		}
+	}()
+	return nil
+}
+
+func (s *Service) stopKeyLogSync() {
+	s.keyLogSyncMu.Lock()
+	if s.keyLogSyncStopped {
+		done := s.keyLogSyncDone
+		s.keyLogSyncMu.Unlock()
+		if done != nil {
+			<-done
+		}
+		return
+	}
+	s.keyLogSyncStopped = true
+	stop := s.keyLogSyncStop
+	done := s.keyLogSyncDone
+	if stop != nil {
+		close(stop)
+	}
+	s.keyLogSyncMu.Unlock()
+	if done != nil {
+		<-done
 	}
 }
 
@@ -223,7 +287,26 @@ func (s *Service) SetHandler(handler Handler) {
 	s.manager.SetHandler(handler)
 }
 
-func (s *Service) Start() error {
+// SetRegistrationLeaseStore installs the shared ownership store before Start.
+// SIP registrations fail closed when no lease store is configured.
+func (s *Service) SetRegistrationLeaseStore(store RegistrationLeaseStore) {
+	s.registrationsMu.Lock()
+	defer s.registrationsMu.Unlock()
+	if s.registrationsStopped || len(s.registrationOwners) > 0 {
+		return
+	}
+	s.registrationLeaseStore = store
+}
+
+func (s *Service) Start() (startErr error) {
+	defer func() {
+		if startErr != nil {
+			// Roll back listeners, monitors, registrations, and the key-log writer
+			// whenever any later startup stage fails.
+			s.Stop()
+		}
+	}()
+
 	s.log.Debugw("starting sip service", "version", version.Version)
 	for name, enabled := range s.conf.Codecs {
 		if enabled {
@@ -277,15 +360,15 @@ func (s *Service) Start() error {
 			if err != nil {
 				return err
 			}
-			s.closers = append(s.closers, f)
+			if err := f.Chmod(0600); err != nil {
+				_ = f.Close()
+				return fmt.Errorf("restrict SIP TLS key-log permissions: %w", err)
+			}
 			keyLog = f
-			go func() {
-				ticker := time.NewTicker(30 * time.Second)
-				defer ticker.Stop()
-				for range ticker.C {
-					f.Sync()
-				}
-			}()
+			if err := s.startKeyLogSync(f); err != nil {
+				_ = f.Close()
+				return err
+			}
 		}
 		tlsConf = &tls.Config{
 			NextProtos:   tlsALPNProtocols(tconf.ALPNProtocols),
@@ -297,8 +380,9 @@ func (s *Service) Start() error {
 			return err
 		}
 
-		ConfigureTLS(tlsConf)
-		opts = append(opts, sipgo.WithUserAgenTLSConfig(tlsConf))
+		clientTLSConf := tlsConf.Clone()
+		ConfigureTLS(clientTLSConf)
+		opts = append(opts, sipgo.WithUserAgenTLSConfig(clientTLSConf))
 	}
 	ua, err := sipgo.NewUA(opts...)
 	if err != nil {
@@ -326,40 +410,58 @@ func (s *Service) startRegistrations(ua *sipgo.UserAgent) error {
 	if len(s.conf.SIPRegistrations) == 0 {
 		return nil
 	}
-	var registrants []*registrant
+	s.registrationsMu.Lock()
+	leaseStore := s.registrationLeaseStore
+	stopped := s.registrationsStopped
+	s.registrationsMu.Unlock()
+	if stopped {
+		return errors.New("SIP registrations already stopped")
+	}
+	if leaseStore == nil {
+		return errors.New("SIP registrations require the shared Redis ownership store; refusing an uncoordinated REGISTER")
+	}
+	var owners []*registrationOwner
+	udpSocketReady := false
+	tp := ua.TransportLayer()
 	for _, rc := range s.conf.SIPRegistrations {
-		r, err := newRegistrant(s.log, s.cli.sipCli, s.mon, s.conf, s.sconf, rc)
+		registration := rc
+		first, err := newRegistrant(s.log, s.cli.sipCli, s.mon, s.conf, s.sconf, registration)
 		if err != nil {
 			return err
 		}
-		registrants = append(registrants, r)
-	}
-	// Only UDP reuses the server's listener, and one wait covers every registration on it.
-	// Registering before it exists would send from an ephemeral port for good, so this is
-	// fatal rather than a warning.
-	if tp := ua.TransportLayer(); tp != nil {
-		for _, r := range registrants {
-			if r.transport != strings.ToUpper(string(TransportUDP)) {
-				continue
-			}
+		// Only UDP reuses the server's listener. Registering before it exists would
+		// send from an ephemeral port, so fail before starting the lease supervisor.
+		if tp != nil && !udpSocketReady && first.transport == strings.ToUpper(string(TransportUDP)) {
 			ctx, cancel := context.WithTimeout(context.Background(), signalingSocketTimeout)
-			err := waitForSignalingSocket(ctx, tp, r.dest())
+			err := waitForSignalingSocket(ctx, tp, first.dest())
 			cancel()
 			if err != nil {
 				return fmt.Errorf("SIP signaling socket did not come up: %w", err)
 			}
-			break
+			udpSocketReady = true
 		}
+		var firstUsed atomic.Bool
+		makeRegistrant := func() (*registrant, error) {
+			if firstUsed.CompareAndSwap(false, true) {
+				return first, nil
+			}
+			return newRegistrant(s.log, s.cli.sipCli, s.mon, s.conf, s.sconf, registration)
+		}
+		owner, err := newRegistrationOwner(s.log, leaseStore, s.conf.NodeID, s.conf.ClusterID, registration, makeRegistrant, s.mon)
+		if err != nil {
+			return err
+		}
+		owners = append(owners, owner)
 	}
 	s.registrationsMu.Lock()
 	defer s.registrationsMu.Unlock()
 	if s.registrationsStopped {
 		return errors.New("SIP registrations already stopped")
 	}
-	s.registrants = registrants
-	s.log.Infow("registering with SIP registrars", "count", len(registrants))
-	for _, r := range registrants {
-		r.Start()
+	s.registrationOwners = owners
+	s.log.Infow("coordinating SIP registrations through shared Redis leases", "count", len(owners))
+	for _, owner := range owners {
+		owner.Start()
 	}
 	return nil
 }
@@ -374,6 +476,9 @@ func validateRegistrations(conf *config.Config) error {
 		}
 		if registrarTransport(&u) == TransportTLS && conf.TLS == nil {
 			return fmt.Errorf("sip_registrations[%d]: a TLS registrar requires the tls config", i)
+		}
+		if rc.ContactHost != "" && !validSIPContactHost(rc.ContactHost) {
+			return fmt.Errorf("sip_registrations[%d]: contact_host must be a DNS name or IP address without a port", i)
 		}
 	}
 	return nil

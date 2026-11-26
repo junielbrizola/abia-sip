@@ -90,6 +90,14 @@ var livekitLast uint32
 
 func runLiveKit(t testing.TB) *LiveKit {
 	id := atomic.AddUint32(&livekitLast, 1)
+	serverRepository := os.Getenv("SIP_TEST_LIVEKIT_SERVER_REPOSITORY")
+	if serverRepository == "" {
+		serverRepository = "abia-realtime-server"
+	}
+	serverTag := os.Getenv("SIP_TEST_LIVEKIT_SERVER_TAG")
+	if serverTag == "" {
+		serverTag = "local"
+	}
 
 	// Shared network so LiveKit reaches Redis by name, avoiding a
 	// container->host round-trip that some CI runners block.
@@ -104,7 +112,7 @@ func runLiveKit(t testing.TB) *LiveKit {
 	c, err := Docker.RunWithOptions(
 		&dockertest.RunOptions{
 			Name:       name,
-			Repository: "livekit/livekit-server", Tag: "master",
+			Repository: serverRepository, Tag: serverTag,
 			Cmd: []string{
 				"--dev",
 				"--redis-host", redisName + ":6379",

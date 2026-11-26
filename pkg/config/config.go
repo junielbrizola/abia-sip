@@ -73,9 +73,8 @@ const (
 // SIPRegistrationConfig makes this node register with a SIP registrar (RFC 3261, section 10),
 // so that a provider can deliver inbound calls to a node it cannot address by a static IP.
 //
-// Registrations are per-node: each node that has them configured registers its own Contact.
-// Point exactly one node at a given registrar account unless the provider supports (and you
-// want) parallel forking to several contacts.
+// Each registration is an AOR shared by the cluster. The SIP service elects one owner through
+// Redis; all replicas must use the same cluster Redis and, for failover, the same ContactHost.
 type SIPRegistrationConfig struct {
 	// Registrar is the address of the registrar: "sip:host[:port][;transport=tcp]", or just
 	// "host[:port]". It becomes the Request-URI of the REGISTER, and the destination it is
@@ -92,6 +91,10 @@ type SIPRegistrationConfig struct {
 	// Domain is the host part of the address-of-record. Defaults to the registrar host, which
 	// is what most providers expect.
 	Domain string `yaml:"domain"`
+	// ContactHost is the stable, externally reachable SIP host advertised in Contact. Set the
+	// same value on every replica when the provider account can fail over between nodes.
+	// Empty retains the per-node signaling address for single-node deployments.
+	ContactHost string `yaml:"contact_host"`
 	// Expiry is the registration lifetime to request. Defaults to DefaultSIPRegistrationExpiry.
 	Expiry time.Duration `yaml:"expiry"`
 	// Keepalive is how often to send OPTIONS to the registrar to keep a NAT binding open.
@@ -218,7 +221,7 @@ func NewConfig(confString string) (*Config, error) {
 		ApiKey:      os.Getenv("LIVEKIT_API_KEY"),
 		ApiSecret:   os.Getenv("LIVEKIT_API_SECRET"),
 		WsUrl:       os.Getenv("LIVEKIT_WS_URL"),
-		ServiceName: "sip",
+		ServiceName: "abia-realtime-sip",
 		PSRPC:       rpc.DefaultPSRPCConfig,
 	}
 	if confString != "" {

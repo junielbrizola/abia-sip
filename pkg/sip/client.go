@@ -381,6 +381,9 @@ func (cm *callManager) createSIPParticipant(ctx context.Context, req *rpc.Intern
 		"reqUser", uri.User,
 		"direction", "outbound",
 	)
+	if appCallID := abiaCallIDFromRoomName(req.RoomName); appCallID != "" {
+		log = log.WithValues("call_id", appCallID)
+	}
 
 	req.ParticipantAttributes = maps.Clone(req.ParticipantAttributes) // shallow clone - string/string map. Needed to avoid mutating psrpc req
 	initial := cm.createSIPCallInfo(uri, from, to, req)

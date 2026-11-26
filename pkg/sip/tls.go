@@ -21,30 +21,36 @@ import (
 )
 
 func ConfigureTLS(c *tls.Config) {
-	// We can't use default cert verification, because SIP headers usually specify IP address instead of a hostname.
-	// At least, we could validate certificate chain using VerifyPeerCertificate and ignore the server name for now.
-	//
-	// Code from crypto/tls.Conn.verifyServerCertificate.
+	// sipgo sets ServerName to the SIP destination host on a cloned outbound
+	// config. VerifyConnection can use it to validate both DNS names and IP SANs.
+	// Keep this callback on the outbound config only; the listener has its own
+	// server-side TLS configuration.
+	verifyConnection := c.VerifyConnection
 	c.InsecureSkipVerify = true
-	c.VerifyPeerCertificate = func(certificates [][]byte, verifiedChains [][]*x509.Certificate) error {
-		certs := make([]*x509.Certificate, len(certificates))
-		for i, asn1Data := range certificates {
-			cert, err := x509.ParseCertificate(asn1Data)
-			if err != nil {
-				return errors.New("failed to parse certificate from server: " + err.Error())
-			}
-			certs[i] = cert
+	c.VerifyPeerCertificate = nil
+	c.VerifyConnection = func(cs tls.ConnectionState) error {
+		if len(cs.PeerCertificates) == 0 {
+			return errors.New("SIP TLS peer did not present a certificate")
+		}
+		if cs.ServerName == "" {
+			return errors.New("SIP TLS destination server name is empty")
+		}
+
+		intermediates := x509.NewCertPool()
+		for _, cert := range cs.PeerCertificates[1:] {
+			intermediates.AddCert(cert)
 		}
 		opts := x509.VerifyOptions{
 			Roots:         c.RootCAs,
-			Intermediates: x509.NewCertPool(),
+			Intermediates: intermediates,
+			DNSName:       cs.ServerName,
 		}
-		for _, cert := range certs[1:] {
-			opts.Intermediates.AddCert(cert)
-		}
-		_, err := certs[0].Verify(opts)
-		if err != nil {
+		if _, err := cs.PeerCertificates[0].Verify(opts); err != nil {
 			return err
+		}
+
+		if verifyConnection != nil {
+			return verifyConnection(cs)
 		}
 		return nil
 	}

@@ -86,6 +86,9 @@ const (
 const (
 	AttrSIPCallIDFull = livekit.AttrSIPPrefix + "callIDFull"
 	AttrSIPCallTag    = livekit.AttrSIPPrefix + "callTag"
+	// AttrABIASIPTraceID carries the private ABIA correlation ID from SIP
+	// signaling into the agent's inbound-call bootstrap.
+	AttrABIASIPTraceID = "abia.telephony.trace_id"
 )
 
 var headerToLog = map[string]string{

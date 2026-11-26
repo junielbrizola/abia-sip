@@ -66,6 +66,7 @@ type Monitor struct {
 	inviteAccept             *prometheus.CounterVec
 	inviteErr                *prometheus.CounterVec
 	callsActive              *prometheus.GaugeVec
+	callsActiveTotal         prometheus.Gauge
 	callsTerminated          *prometheus.CounterVec
 	callsTerminationFailures *prometheus.CounterVec
 	packetsRTP               *prometheus.CounterVec
@@ -85,7 +86,9 @@ type Monitor struct {
 	transfersSucceeded       *prometheus.CounterVec
 	transfersFailed          *prometheus.CounterVec
 	transfersActive          *prometheus.GaugeVec
-	registrationsActive      *prometheus.GaugeVec
+	registrationsActiveTotal prometheus.Gauge
+	registrationLeaseOwned   prometheus.Gauge
+	registrationLeaseEvents  *prometheus.CounterVec
 
 	cpu            *hwstats.CPUStats
 	maxUtilization float64
@@ -170,13 +173,37 @@ func (m *Monitor) Start(conf *config.Config) error {
 		ConstLabels: prometheus.Labels{"node_id": conf.NodeID},
 	}, []string{"dir", "to", "provider"}))
 
-	m.registrationsActive = mustRegister(m, prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	m.callsActiveTotal = mustRegister(m, prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace:   "livekit",
 		Subsystem:   "sip",
-		Name:        "registrations_active",
-		Help:        "Whether this node currently has a binding at a SIP registrar",
+		Name:        "calls_active_total",
+		Help:        "Number of SIP calls currently active on this node",
 		ConstLabels: prometheus.Labels{"node_id": conf.NodeID},
-	}, []string{"registrar", "aor"}))
+	}))
+
+	m.registrationsActiveTotal = mustRegister(m, prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace:   "livekit",
+		Subsystem:   "sip",
+		Name:        "registrations_active_total",
+		Help:        "Number of SIP registrar bindings currently active on this node",
+		ConstLabels: prometheus.Labels{"node_id": conf.NodeID},
+	}))
+
+	m.registrationLeaseOwned = mustRegister(m, prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace:   "livekit",
+		Subsystem:   "sip",
+		Name:        "registration_lease_owned",
+		Help:        "Number of upstream SIP registrations currently owned by this node through Redis leases",
+		ConstLabels: prometheus.Labels{"node_id": conf.NodeID},
+	}))
+
+	m.registrationLeaseEvents = mustRegister(m, prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace:   "livekit",
+		Subsystem:   "sip",
+		Name:        "registration_lease_events_total",
+		Help:        "SIP registration lease outcomes; result is a bounded, low-cardinality classification",
+		ConstLabels: prometheus.Labels{"node_id": conf.NodeID},
+	}, []string{"result"}))
 
 	m.callsTerminated = mustRegister(m, prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace:   "livekit",
@@ -480,6 +507,7 @@ func (c *CallMonitor) CallStart() {
 	p := c.providerLabel()
 	c.providerRecordedAtCallStart.Store(&p)
 	c.m.callsActive.With(c.labels(prometheus.Labels{"provider": p})).Inc()
+	c.m.callsActiveTotal.Inc()
 }
 
 func (c *CallMonitor) CallEnd() {
@@ -487,6 +515,7 @@ func (c *CallMonitor) CallEnd() {
 		return
 	}
 	c.m.callsActive.With(c.labels(prometheus.Labels{"provider": *c.providerRecordedAtCallStart.Load()})).Dec()
+	c.m.callsActiveTotal.Dec()
 }
 
 func (c *CallMonitor) CallTerminate(t Termination) {
@@ -628,15 +657,36 @@ func (c *CallMonitor) SDPParseError() {
 	}).Inc()
 }
 
-// RegistrationActive records whether a SIP registration currently has a binding. Inbound calls
-// on a registered trunk stop arriving when it does not, so it is worth alerting on. The
-// address-of-record is a label of its own because several accounts can share one registrar.
-func (m *Monitor) RegistrationActive(registrar, aor string, active bool) {
-	v := float64(0)
-	if active {
-		v = 1
+// RegistrationActive records only an aggregate count. Registrar URIs and
+// addresses-of-record can contain customer or phone-number data and must not
+// become Prometheus labels.
+func (m *Monitor) RegistrationActive(wasActive, active bool) {
+	if !wasActive && active {
+		m.registrationsActiveTotal.Inc()
+	} else if wasActive && !active {
+		m.registrationsActiveTotal.Dec()
 	}
-	m.registrationsActive.WithLabelValues(registrar, aor).Set(v)
+}
+
+// RegistrationLeaseOwned changes the number of registration leases currently owned by this
+// node. The gauge deliberately has no account or registrar labels.
+func (m *Monitor) RegistrationLeaseOwned(delta float64) {
+	if m.registrationLeaseOwned != nil && delta != 0 {
+		m.registrationLeaseOwned.Add(delta)
+	}
+}
+
+// RegistrationLeaseEvent records a bounded registration ownership outcome. Keep result values
+// fixed so malformed configuration cannot create unbounded metric cardinality.
+func (m *Monitor) RegistrationLeaseEvent(result string) {
+	switch result {
+	case "acquired", "busy", "lease_error", "redis_error", "renewal_error", "lost", "released", "release_error", "registrant_error":
+	default:
+		return
+	}
+	if m.registrationLeaseEvents != nil {
+		m.registrationLeaseEvents.WithLabelValues(result).Inc()
+	}
 }
 
 func (m *Monitor) TransferStarted(dir CallDir) {

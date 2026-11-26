@@ -17,6 +17,7 @@ package config
 import (
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"slices"
 
 	"github.com/livekit/protocol/logger"
@@ -27,6 +28,9 @@ import (
 // If WarnOnly is set, they are not applied. Instead, c keeps Go's defaults and logs a warning
 // for each handshake that negotiates a version or cipher suite outside of them.
 func (conf *TLSConfig) ApplyPolicy(log logger.Logger, c *tls.Config) error {
+	if err := validateALPNProtocols(conf.ALPNProtocols); err != nil {
+		return err
+	}
 	suites, err := parseCipherSuites(log, conf.CipherSuites)
 	if err != nil {
 		return err
@@ -38,6 +42,9 @@ func (conf *TLSConfig) ApplyPolicy(log logger.Logger, c *tls.Config) error {
 	maxVer, err := parseTLSVersion(conf.MaxVersion)
 	if err != nil {
 		return err
+	}
+	if minVer != 0 && maxVer != 0 && minVer > maxVer {
+		return fmt.Errorf("TLS min_version %q is greater than max_version %q", conf.MinVersion, conf.MaxVersion)
 	}
 	if !conf.WarnOnly {
 		c.CipherSuites = suites
@@ -61,6 +68,23 @@ func (conf *TLSConfig) ApplyPolicy(log logger.Logger, c *tls.Config) error {
 			)
 		}
 		return nil // only warn, never fail the handshake
+	}
+	return nil
+}
+
+func validateALPNProtocols(protocols []string) error {
+	const maxALPNListSize = (1 << 16) - 1
+
+	encodedSize := 0
+	for i, protocol := range protocols {
+		if len(protocol) == 0 || len(protocol) > 255 {
+			return fmt.Errorf("TLS alpn[%d] must be between 1 and 255 bytes", i)
+		}
+		entrySize := len(protocol) + 1 // one-byte length prefix
+		if entrySize > maxALPNListSize-encodedSize {
+			return fmt.Errorf("TLS alpn list exceeds %d encoded bytes", maxALPNListSize)
+		}
+		encodedSize += entrySize
 	}
 	return nil
 }
